@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/netbirdio/netbird/management/server/telemetry"
@@ -63,6 +65,14 @@ func NewDexManager(config DexClientConfig, appMetrics telemetry.AppMetrics) (*De
 		return nil, fmt.Errorf("dex IdP configuration is incomplete, Issuer is missing")
 	}
 
+	if config.TokenEndpoint == "" {
+		return nil, fmt.Errorf("dex IdP configuration is incomplete, TokenEndpoint is missing")
+	}
+
+	if config.GrantType == "" {
+		return nil, fmt.Errorf("dex IdP configuration is incomplete, GrantType is missing")
+	}
+
 	client := &oauth2.Config{
 		ClientID:     config.ClientID,
 		ClientSecret: config.ClientSecret,
@@ -88,18 +98,99 @@ func NewDexManager(config DexClientConfig, appMetrics telemetry.AppMetrics) (*De
 	}, nil
 }
 
-// GetUserDataByID requests user data from Dex via ID.
-func (dm *DexManager) GetUserDataByID(ctx context.Context, userID string, appMetadata AppMetadata) (*UserData, error) {
-	endpoint := fmt.Sprintf("%s/api/v1/users/%s", dm.credentials.clientConfig.Issuer, userID)
+// Authenticate retrieves access token to use the dex user API.
+func (dm *DexManager) Authenticate(ctx context.Context) (JWTToken, error) {
+	data := url.Values{}
+	data.Set("grant_type", dm.credentials.clientConfig.GrantType)
+	data.Set("client_id", dm.credentials.clientConfig.ClientID)
+	data.Set("client_secret", dm.credentials.clientConfig.ClientSecret)
+	data.Set("scope", "openid email profile")
 
-	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, "POST", dm.credentials.clientConfig.TokenEndpoint, strings.NewReader(data.Encode()))
+	if err != nil {
+		return JWTToken{}, fmt.Errorf("failed to create token request: %v", err)
+	}
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := dm.httpClient.Do(req)
+	if err != nil {
+		return JWTToken{}, fmt.Errorf("failed to execute token request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return JWTToken{}, fmt.Errorf("token request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var tokenResponse struct {
+		AccessToken string `json:"access_token"`
+		TokenType   string `json:"token_type"`
+		ExpiresIn   int    `json:"expires_in"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResponse); err != nil {
+		return JWTToken{}, fmt.Errorf("failed to decode token response: %v", err)
+	}
+
+	if tokenResponse.AccessToken == "" {
+		return JWTToken{}, fmt.Errorf("received empty access token")
+	}
+
+	return JWTToken{
+		AccessToken: tokenResponse.AccessToken,
+		TokenType:   tokenResponse.TokenType,
+		ExpiresIn:   tokenResponse.ExpiresIn,
+	}, nil
+}
+
+// authenticatedRequest makes an authenticated request
+func (dm *DexManager) authenticatedRequest(ctx context.Context, method, endpoint string, body io.Reader) (*http.Response, error) {
+	token, err := dm.Authenticate(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to authenticate: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
 
-	resp, err := dm.httpClient.Do(req)
+	req.Header.Set("Authorization", fmt.Sprintf("%s %s", token.TokenType, token.AccessToken))
+
+	return dm.httpClient.Do(req)
+}
+
+// parseDexUser parses Dex user data into UserData struct.
+func (dc *DexCredentials) parseDexUser(dexUser map[string]interface{}) (*UserData, error) {
+	email, _ := dexUser["email"].(string)
+	id, _ := dexUser["sub"].(string)
+	name, _ := dexUser["name"].(string)
+
+	if email == "" || id == "" {
+		return nil, fmt.Errorf("invalid dex user: missing required fields")
+	}
+
+	if name == "" {
+		name = email
+	}
+
+	return &UserData{
+		Email: email,
+		Name:  name,
+		ID:    id,
+	}, nil
+}
+
+// GetUserDataByID requests user data from Dex via ID.
+func (dm *DexManager) GetUserDataByID(ctx context.Context, userID string, appMetadata AppMetadata) (*UserData, error) {
+	endpoint := fmt.Sprintf("%s/api/v1/users/%s", dm.credentials.clientConfig.Issuer, userID)
+
+	resp, err := dm.authenticatedRequest(ctx, "GET", endpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get user data: %v", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -119,7 +210,7 @@ func (dm *DexManager) GetUserDataByID(ctx context.Context, userID string, appMet
 		return nil, fmt.Errorf("failed to decode user data: %v", err)
 	}
 
-	userData, err := dm.parseDexUser(dexUser)
+	userData, err := dm.credentials.parseDexUser(dexUser)
 	if err != nil {
 		return nil, err
 	}
@@ -132,14 +223,9 @@ func (dm *DexManager) GetUserDataByID(ctx context.Context, userID string, appMet
 func (dm *DexManager) GetUserByEmail(ctx context.Context, email string) ([]*UserData, error) {
 	endpoint := fmt.Sprintf("%s/api/v1/users?email=%s", dm.credentials.clientConfig.Issuer, url.QueryEscape(email))
 
-	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	resp, err := dm.authenticatedRequest(ctx, "GET", endpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
-	}
-
-	resp, err := dm.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get user by email: %v", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -159,7 +245,7 @@ func (dm *DexManager) GetUserByEmail(ctx context.Context, email string) ([]*User
 		return nil, fmt.Errorf("failed to decode user data: %v", err)
 	}
 
-	userData, err := dm.parseDexUser(dexUser)
+	userData, err := dm.credentials.parseDexUser(dexUser)
 	if err != nil {
 		return nil, err
 	}
@@ -207,14 +293,9 @@ func (dm *DexManager) GetAllAccounts(ctx context.Context) (map[string][]*UserDat
 func (dm *DexManager) getAllUsers(ctx context.Context) ([]*UserData, error) {
 	endpoint := fmt.Sprintf("%s/api/v1/users", dm.credentials.clientConfig.Issuer)
 
-	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	resp, err := dm.authenticatedRequest(ctx, "GET", endpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
-	}
-
-	resp, err := dm.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get all users: %v", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -232,7 +313,7 @@ func (dm *DexManager) getAllUsers(ctx context.Context) ([]*UserData, error) {
 
 	users := make([]*UserData, 0, len(dexUsers))
 	for _, dexUser := range dexUsers {
-		userData, err := dm.parseDexUser(dexUser)
+		userData, err := dm.credentials.parseDexUser(dexUser)
 		if err != nil {
 			return nil, err
 		}
@@ -240,33 +321,6 @@ func (dm *DexManager) getAllUsers(ctx context.Context) ([]*UserData, error) {
 	}
 
 	return users, nil
-}
-
-// parseDexUser parses Dex user data into UserData struct.
-func (dm *DexManager) parseDexUser(dexUser map[string]interface{}) (*UserData, error) {
-	email, _ := dexUser["email"].(string)
-	id, _ := dexUser["sub"].(string)
-	name, _ := dexUser["name"].(string)
-
-	if email == "" || id == "" {
-		return nil, fmt.Errorf("invalid dex user: missing required fields")
-	}
-
-	// If name is not set, use email as name
-	if name == "" {
-		name = email
-	}
-
-	return &UserData{
-		Email: email,
-		Name:  name,
-		ID:    id,
-	}, nil
-}
-
-// Authenticate retrieves access token to use the dex user API.
-func (dc *DexCredentials) Authenticate(ctx context.Context) (JWTToken, error) {
-	return JWTToken{}, nil
 }
 
 // CreateUser creates a new user in Dex IdP and sends an invitation.
@@ -283,14 +337,9 @@ func (dm *DexManager) UpdateUserAppMetadata(ctx context.Context, userID string, 
 func (dm *DexManager) DeleteUser(ctx context.Context, userID string) error {
 	endpoint := fmt.Sprintf("%s/api/v1/users/%s", dm.credentials.clientConfig.Issuer, userID)
 
-	req, err := http.NewRequestWithContext(ctx, "DELETE", endpoint, nil)
+	resp, err := dm.authenticatedRequest(ctx, "DELETE", endpoint, nil)
 	if err != nil {
-		return fmt.Errorf("failed to create request: %v", err)
-	}
-
-	resp, err := dm.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to delete user: %v", err)
+		return err
 	}
 	defer resp.Body.Close()
 
