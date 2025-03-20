@@ -189,7 +189,6 @@ func NewManager(ctx context.Context, config Config, appMetrics telemetry.AppMetr
 			ClientSecret:  config.ClientConfig.ClientSecret,
 			Issuer:        config.ClientConfig.Issuer,
 			TokenEndpoint: config.ClientConfig.TokenEndpoint,
-			GrantType:     config.ClientConfig.GrantType,
 		}
 		return NewDexManager(dexClientConfig, appMetrics)
 	default:

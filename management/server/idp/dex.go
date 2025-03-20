@@ -29,7 +29,6 @@ type DexClientConfig struct {
 	ClientSecret  string
 	Issuer        string
 	TokenEndpoint string
-	GrantType     string
 }
 
 // DexCredentials contains the Dex authentication information.
@@ -69,10 +68,6 @@ func NewDexManager(config DexClientConfig, appMetrics telemetry.AppMetrics) (*De
 		return nil, fmt.Errorf("dex IdP configuration is incomplete, TokenEndpoint is missing")
 	}
 
-	if config.GrantType == "" {
-		return nil, fmt.Errorf("dex IdP configuration is incomplete, GrantType is missing")
-	}
-
 	client := &oauth2.Config{
 		ClientID:     config.ClientID,
 		ClientSecret: config.ClientSecret,
@@ -98,10 +93,26 @@ func NewDexManager(config DexClientConfig, appMetrics telemetry.AppMetrics) (*De
 	}, nil
 }
 
+// authenticatedRequest выполняет запрос с аутентификацией
+func (dm *DexManager) authenticatedRequest(ctx context.Context, method, endpoint string, body io.Reader) (*http.Response, error) {
+	token, err := dm.Authenticate(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to authenticate: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("%s %s", token.TokenType, token.AccessToken))
+
+	return dm.httpClient.Do(req)
+}
+
 // Authenticate retrieves access token to use the dex user API.
 func (dm *DexManager) Authenticate(ctx context.Context) (JWTToken, error) {
 	data := url.Values{}
-	data.Set("grant_type", dm.credentials.clientConfig.GrantType)
 	data.Set("client_id", dm.credentials.clientConfig.ClientID)
 	data.Set("client_secret", dm.credentials.clientConfig.ClientSecret)
 	data.Set("scope", "openid email profile")
@@ -146,44 +157,6 @@ func (dm *DexManager) Authenticate(ctx context.Context) (JWTToken, error) {
 	}, nil
 }
 
-// authenticatedRequest makes an authenticated request
-func (dm *DexManager) authenticatedRequest(ctx context.Context, method, endpoint string, body io.Reader) (*http.Response, error) {
-	token, err := dm.Authenticate(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to authenticate: %v", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
-	}
-
-	req.Header.Set("Authorization", fmt.Sprintf("%s %s", token.TokenType, token.AccessToken))
-
-	return dm.httpClient.Do(req)
-}
-
-// parseDexUser parses Dex user data into UserData struct.
-func (dc *DexCredentials) parseDexUser(dexUser map[string]interface{}) (*UserData, error) {
-	email, _ := dexUser["email"].(string)
-	id, _ := dexUser["sub"].(string)
-	name, _ := dexUser["name"].(string)
-
-	if email == "" || id == "" {
-		return nil, fmt.Errorf("invalid dex user: missing required fields")
-	}
-
-	if name == "" {
-		name = email
-	}
-
-	return &UserData{
-		Email: email,
-		Name:  name,
-		ID:    id,
-	}, nil
-}
-
 // GetUserDataByID requests user data from Dex via ID.
 func (dm *DexManager) GetUserDataByID(ctx context.Context, userID string, appMetadata AppMetadata) (*UserData, error) {
 	endpoint := fmt.Sprintf("%s/api/v1/users/%s", dm.credentials.clientConfig.Issuer, userID)
@@ -210,7 +183,7 @@ func (dm *DexManager) GetUserDataByID(ctx context.Context, userID string, appMet
 		return nil, fmt.Errorf("failed to decode user data: %v", err)
 	}
 
-	userData, err := dm.credentials.parseDexUser(dexUser)
+	userData, err := dm.parseDexUser(dexUser)
 	if err != nil {
 		return nil, err
 	}
@@ -245,7 +218,7 @@ func (dm *DexManager) GetUserByEmail(ctx context.Context, email string) ([]*User
 		return nil, fmt.Errorf("failed to decode user data: %v", err)
 	}
 
-	userData, err := dm.credentials.parseDexUser(dexUser)
+	userData, err := dm.parseDexUser(dexUser)
 	if err != nil {
 		return nil, err
 	}
@@ -313,7 +286,7 @@ func (dm *DexManager) getAllUsers(ctx context.Context) ([]*UserData, error) {
 
 	users := make([]*UserData, 0, len(dexUsers))
 	for _, dexUser := range dexUsers {
-		userData, err := dm.credentials.parseDexUser(dexUser)
+		userData, err := dm.parseDexUser(dexUser)
 		if err != nil {
 			return nil, err
 		}
@@ -321,6 +294,27 @@ func (dm *DexManager) getAllUsers(ctx context.Context) ([]*UserData, error) {
 	}
 
 	return users, nil
+}
+
+// parseDexUser parses Dex user data into UserData struct.
+func (dm *DexManager) parseDexUser(dexUser map[string]interface{}) (*UserData, error) {
+	email, _ := dexUser["email"].(string)
+	id, _ := dexUser["sub"].(string)
+	name, _ := dexUser["name"].(string)
+
+	if email == "" || id == "" {
+		return nil, fmt.Errorf("invalid dex user: missing required fields")
+	}
+
+	if name == "" {
+		name = email
+	}
+
+	return &UserData{
+		Email: email,
+		Name:  name,
+		ID:    id,
+	}, nil
 }
 
 // CreateUser creates a new user in Dex IdP and sends an invitation.
