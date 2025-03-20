@@ -183,6 +183,14 @@ func NewManager(ctx context.Context, config Config, appMetrics telemetry.AppMetr
 			APIToken: config.ExtraConfig["ApiToken"],
 		}
 		return NewJumpCloudManager(jumpcloudConfig, appMetrics)
+	case "dex":
+		dexClientConfig := DexClientConfig{
+			ClientID:      config.ClientConfig.ClientID,
+			ClientSecret:  config.ClientConfig.ClientSecret,
+			Issuer:        config.ClientConfig.Issuer,
+			TokenEndpoint: config.ClientConfig.TokenEndpoint,
+		}
+		return NewDexManager(dexClientConfig, appMetrics)
 	default:
 		return nil, fmt.Errorf("invalid manager type: %s", config.ManagerType)
 	}
